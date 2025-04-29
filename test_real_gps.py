@@ -14,7 +14,7 @@ logger = logging.getLogger("test_real_gps")
 
 def main():
     # Use COM8 for the GPS device (based on available ports)
-    gps_port = "COM3"
+    gps_port = "COM9"
     
     # Try different baudrates if needed
     baudrate = 4800

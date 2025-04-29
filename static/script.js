@@ -458,8 +458,8 @@ function initializeMap(devices) {
                 })
             };
             
-            // Add the street layer by default
-            baseLayers['Street'].addTo(map);
+            // Add the dark layer by default to match the black background theme
+            baseLayers['Dark'].addTo(map);
             
             // Create layer controls and add to map
             L.control.layers(baseLayers, {}, {
@@ -701,12 +701,12 @@ function updateMarkerForDevice(device) {
             markerOpacity = 0.5;
         }
         
-        // Create marker icon
+        // Create marker icon with enhanced visibility for dark backgrounds
         const signalStrength = getSignalStrength(device.power);
         const markerIcon = L.divIcon({
             className: `device-marker signal-${signalStrength}`,
-            html: `<div class="device-marker-icon ${markerColor}" style="opacity: ${markerOpacity};"></div>`,
-            iconSize: [20, 20]
+            html: `<div class="device-marker-icon ${markerColor}" style="opacity: ${markerOpacity}; border: 2px solid white; box-shadow: 0 0 5px rgba(255, 255, 255, 0.5);"></div>`,
+            iconSize: [24, 24]
         });
         
         // Create or update marker

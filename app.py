@@ -39,7 +39,7 @@ rf_monitor = RFMonitor()
 
 # Initialize GPS module - update the port to match your GPS device
 # Common ports: 'COM3' on Windows, '/dev/ttyUSB0' or '/dev/ttyACM0' on Linux
-GPS_PORT = os.environ.get('GPS_PORT', 'COM3')  # Default to COM5, override with environment variable
+GPS_PORT = os.environ.get('GPS_PORT', 'COM9')  # Default to COM5, override with environment variable
 
 # Default monitoring location (used when GPS is not available)
 DEFAULT_MONITORING_LOCATION = {
@@ -351,6 +351,147 @@ def update_device_db(device):
         logger.error(f"Error updating device database: {e}")
         traceback.print_exc()
 
+# Helper function to estimate device location based on signal strength
+def estimate_location_from_signal(monitoring_location, signal_power, frequency_mhz, device_id=None):
+    """
+    Estimate device location based on signal strength using a simplified radio propagation model.
+    
+    Args:
+        monitoring_location: Dict with latitude and longitude of the monitoring station
+        signal_power: Signal power in dB
+        frequency_mhz: Signal frequency in MHz
+        device_id: Optional device ID to ensure consistent direction for the same device
+        
+    Returns:
+        Dict with estimated latitude and longitude
+    """
+    try:
+        # Normalize power to a reasonable range (-100 dB to 0 dB)
+        # Weaker signals (more negative dB) are further away
+        normalized_power = min(max(signal_power, -100), 0)
+        
+        # Convert to a distance estimate using a simplified path loss model
+        # Reduce the impact of frequency to make locations more stable during frequency hopping
+        # Use a much smaller frequency factor (0.1 power instead of 0.5 from sqrt)
+        frequency_factor = math.pow(frequency_mhz / 900, 0.1)  # Very mild frequency adjustment
+        
+        # Calculate estimated distance in degrees (roughly 111km per degree at equator)
+        # This is a simplified model: stronger signals = closer, weaker = further
+        # Use a smaller random variation (±10% instead of ±20%) for more stability
+        if device_id:  # For known devices, use even less variation for stability
+            distance_variation = random.uniform(0.95, 1.05)  # Only ±5% for known devices
+        else:
+            distance_variation = random.uniform(0.9, 1.1)  # ±10% for unknown devices
+            
+        base_distance = (abs(normalized_power) / 100) * 0.03 * frequency_factor * distance_variation
+        
+        # Determine direction based on device_id if provided, otherwise use random direction
+        if device_id:
+            # Use hash of device_id to get a consistent angle
+            import hashlib
+            
+            # Create a more stable hash that's consistent for the same device
+            # Only use the first part of the device ID to ensure stability across frequency changes
+            stable_id = str(device_id).split('-')[0] if '-' in str(device_id) else str(device_id)
+            
+            # Get a hash value and convert to an angle (0-360 degrees)
+            hash_val = int(hashlib.md5(stable_id.encode()).hexdigest(), 16)
+            
+            # Use a much smaller angle variation (±5 degrees instead of ±30) for more stability
+            # This keeps the device in roughly the same direction even when frequency hopping
+            base_angle = (hash_val % 360) * (math.pi / 180)  # Convert to radians
+            angle_variation = random.uniform(-5, 5) * (math.pi / 180)  # ±5 degrees in radians
+            direction = (base_angle + angle_variation) % (2 * math.pi)
+        else:
+            # Random direction if no device_id provided
+            direction = random.uniform(0, 2 * math.pi)
+        
+        # Add minimal randomness to prevent signals with similar power from clumping
+        # But keep it much smaller for stability during frequency hopping
+        # Stronger signals have less variability (more accurate positioning)
+        power_factor = abs(normalized_power) / 100  # 0 to 1 scale (0 = strongest, 1 = weakest)
+        
+        # Reduce variability significantly for more stable positioning
+        if device_id:  # Even less variability for known devices
+            variability = 0.0005 + (power_factor * 0.002)  # Much smaller variation
+        else:
+            variability = 0.001 + (power_factor * 0.004)  # Still smaller than before
+        
+        # Apply smaller random offsets for more stability
+        random_offset_lat = random.uniform(-variability, variability)
+        random_offset_lng = random.uniform(-variability, variability)
+        
+        # Convert polar coordinates (distance, direction) to lat/lng offsets
+        lat_offset = base_distance * math.cos(direction) + random_offset_lat
+        lng_offset = base_distance * math.sin(direction) + random_offset_lng
+        
+        # Check if we should use a cached location for this device to maintain stability
+        # This is a simple in-memory cache to keep device locations stable
+        global _device_location_cache
+        if not hasattr(estimate_location_from_signal, '_device_location_cache'):
+            estimate_location_from_signal._device_location_cache = {}
+            estimate_location_from_signal._cache_timestamp = {}
+            
+        # If we have a device ID and a recent cached location, blend with the new location
+        current_time = time.time()
+        cache_max_age = 30.0  # 30 seconds max age for cached locations
+        
+        if device_id and device_id in estimate_location_from_signal._device_location_cache:
+            # Check if the cached location is recent enough
+            if (current_time - estimate_location_from_signal._cache_timestamp.get(device_id, 0)) < cache_max_age:
+                # Get cached location
+                cached_loc = estimate_location_from_signal._device_location_cache[device_id]
+                
+                # Blend new and cached locations (80% cached, 20% new for stability)
+                # Stronger signals get more weight for the new location
+                # Weaker signals rely more on the cached location
+                blend_factor = 0.2 * (1 - power_factor)  # 0.0 to 0.2 (more weight to new location for stronger signals)
+                
+                blended_lat = cached_loc["latitude"] * (1 - blend_factor) + (monitoring_location["latitude"] + lat_offset) * blend_factor
+                blended_lng = cached_loc["longitude"] * (1 - blend_factor) + (monitoring_location["longitude"] + lng_offset) * blend_factor
+                
+                # Update the cache with the blended location
+                estimate_location_from_signal._device_location_cache[device_id] = {
+                    "latitude": blended_lat,
+                    "longitude": blended_lng,
+                    "estimated_distance_km": base_distance * 111,
+                    "signal_strength_db": signal_power
+                }
+                estimate_location_from_signal._cache_timestamp[device_id] = current_time
+                
+                return estimate_location_from_signal._device_location_cache[device_id]
+        
+        # If no cached location or cache is too old, use the new calculated location
+        new_location = {
+            "latitude": monitoring_location["latitude"] + lat_offset,
+            "longitude": monitoring_location["longitude"] + lng_offset,
+            "estimated_distance_km": base_distance * 111,  # Rough conversion to km
+            "signal_strength_db": signal_power
+        }
+        
+        # Cache the new location if we have a device ID
+        if device_id:
+            estimate_location_from_signal._device_location_cache[device_id] = new_location
+            estimate_location_from_signal._cache_timestamp[device_id] = current_time
+            
+            # Clean old cache entries
+            for key in list(estimate_location_from_signal._cache_timestamp.keys()):
+                if current_time - estimate_location_from_signal._cache_timestamp[key] > cache_max_age:
+                    del estimate_location_from_signal._device_location_cache[key]
+                    del estimate_location_from_signal._cache_timestamp[key]
+        
+        return new_location
+    except Exception as e:
+        logger.error(f"Error estimating location from signal: {e}")
+        # Fall back to a small random offset if estimation fails
+        lat_offset = (random.random() - 0.5) * 0.005
+        lng_offset = (random.random() - 0.5) * 0.005
+        return {
+            "latitude": monitoring_location["latitude"] + lat_offset,
+            "longitude": monitoring_location["longitude"] + lng_offset,
+            "estimated": False
+        }
+
 # Helper function to get current GPS location
 def get_current_gps_location():
     """Get the current GPS location from the GPS module"""
@@ -452,15 +593,29 @@ async def get_devices():
                     
                     # Add location information to the device (based on monitoring station)
                     if monitoring_station_location:
-                        # Add a small random offset to make devices appear around the monitoring station
-                        # This simulates different device locations
-                        lat_offset = (random.random() - 0.5) * 0.005  # ~500m radius
-                        lng_offset = (random.random() - 0.5) * 0.005
+                        # Get signal power and frequency from the device
+                        signal_power = device.get('power', -70)  # Default to -70dB if not available
+                        frequency_mhz = device.get('frequency', 900) / 1e6  # Convert Hz to MHz
+                        device_id = device.get('id', '')
                         
-                        device['location'] = {
-                            "latitude": monitoring_station_location["latitude"] + lat_offset,
-                            "longitude": monitoring_station_location["longitude"] + lng_offset
-                        }
+                        # Use signal strength to estimate location with device ID for consistent direction
+                        estimated_location = estimate_location_from_signal(
+                            monitoring_station_location, 
+                            signal_power, 
+                            frequency_mhz,
+                            device_id
+                        )
+                        
+                        # Add device ID as a seed for consistent direction if needed
+                        device_id = device.get('id', '')
+                        if device_id and 'direction_seed' not in device:
+                            # Hash the device ID to get a consistent direction seed
+                            import hashlib
+                            direction_seed = int(hashlib.md5(device_id.encode()).hexdigest(), 16) % 360
+                            device['direction_seed'] = direction_seed
+                        
+                        # Update the device location with the estimated location
+                        device['location'] = estimated_location
                     else:
                         # If no GPS, use a default location
                         device['location'] = {
@@ -688,16 +843,30 @@ async def broadcast_data():
                     
                     # Add location information to the device (based on monitoring station)
                     if monitoring_station_location:
-                        # Pre-calculate offsets for efficiency
-                        is_simulated = monitoring_station_location.get('simulated', True)
-                        offset_factor = 0.005 if is_simulated else 0.002
-                        rnd_offset = random.random() - 0.5
+                        # Get signal power and frequency from the device
+                        signal_power = device.get('power', -70)  # Default to -70dB if not available
+                        frequency_mhz = device.get('frequency', 900) / 1e6  # Convert Hz to MHz
+                        device_id = device.get('id', '')
                         
-                        device['location'] = {
-                            "latitude": monitoring_station_location["latitude"] + (rnd_offset * offset_factor),
-                            "longitude": monitoring_station_location["longitude"] + (rnd_offset * offset_factor),
-                            "using_gps": not is_simulated
-                        }
+                        # Use signal strength to estimate location with device ID for consistent direction
+                        estimated_location = estimate_location_from_signal(
+                            monitoring_station_location, 
+                            signal_power, 
+                            frequency_mhz,
+                            device_id
+                        )
+                        
+                        # Add device ID as a seed for consistent direction if needed
+                        device_id = device.get('id', '')
+                        if device_id and 'direction_seed' not in device:
+                            # Hash the device ID to get a consistent direction seed
+                            import hashlib
+                            direction_seed = int(hashlib.md5(device_id.encode()).hexdigest(), 16) % 360
+                            device['direction_seed'] = direction_seed
+                        
+                        # Update the device location with the estimated location
+                        device['location'] = estimated_location
+                        device['location']['using_gps'] = not monitoring_station_location.get('simulated', True)
                     else:
                         device['location'] = DEFAULT_MONITORING_LOCATION
                     
